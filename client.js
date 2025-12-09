@@ -1,7 +1,11 @@
 var Target = require("montage/core/target").Target,
     Promise = require('montage/core/promise').Promise,
     Uuid = require('montage/core/uuid'),
-    RTCPeerConnection = webkitRTCPeerConnection,
+    // Use standard RTCPeerConnection with fallback for older browsers
+    RTCPeerConnection = (typeof window !== 'undefined' && window.RTCPeerConnection) ||
+                        (typeof window !== 'undefined' && window.webkitRTCPeerConnection) ||
+                        (typeof window !== 'undefined' && window.mozRTCPeerConnection) ||
+                        (typeof global !== 'undefined' && global.RTCPeerConnection),
     ROLE_SIGNALING = 'signaling',
     ROLE_DATA = 'data',
     ROLE_MEDIA = 'media',
@@ -147,7 +151,18 @@ var RTCService = Target.specialize({
                     if (!self._peerConnections[ROLE_MEDIA]) {
                         self._peerConnections[ROLE_MEDIA] = self._createPeerConnection(ROLE_MEDIA);
                     }
-                    self._peerConnections[ROLE_MEDIA].addStream(stream);
+
+                    // Remove existing tracks (modern API)
+                    var senders = self._peerConnections[ROLE_MEDIA].getSenders();
+                    senders.forEach(function(sender) {
+                        self._peerConnections[ROLE_MEDIA].removeTrack(sender);
+                    });
+
+                    // Add each track from the stream (modern API)
+                    stream.getTracks().forEach(function(track) {
+                        self._peerConnections[ROLE_MEDIA].addTrack(track, stream);
+                    });
+
                     self._peerConnections[ROLE_MEDIA].streamId = stream.id;
                     resolve();
                 } catch (err) {
@@ -161,8 +176,11 @@ var RTCService = Target.specialize({
         value: function() {
             var mediaPeerConnection = this._peerConnections[ROLE_MEDIA];
             if (mediaPeerConnection) {
-                var stream = mediaPeerConnection.getStreamById(mediaPeerConnection.streamId);
-                mediaPeerConnection.removeStream(stream);
+                // Remove all tracks using modern API
+                var senders = mediaPeerConnection.getSenders();
+                senders.forEach(function(sender) {
+                    mediaPeerConnection.removeTrack(sender);
+                });
             }
         }
     },
@@ -261,11 +279,19 @@ var RTCService = Target.specialize({
                 self._handleLocalIceCandidate(peerConnection, event.candidate);
             };
 
-            peerConnection.onaddstream = function(event) {
-                event.remoteId = self._targetClient;
-                self.dispatchEvent(event);
+            // Use modern ontrack event instead of deprecated onaddstream
+            peerConnection.ontrack = function(event) {
+                // Create a custom event similar to the old onaddstream format
+                var streamEvent = {
+                    stream: event.streams[0],
+                    remoteId: self._targetClient,
+                    type: 'addstream'
+                };
+                self.dispatchEvent(streamEvent);
             };
 
+            // Note: onremovestream is deprecated and has no direct replacement
+            // Track removal is handled via ontrack events and stream.onremovetrack
             peerConnection.onremovestream = function(event) {
                 event.remoteId = self._targetClient;
                 self.dispatchEvent(event);
@@ -331,33 +357,32 @@ var RTCService = Target.specialize({
     },
 
     _createOffer: {
-        value: function(peerConnection) {
-            return new Promise.Promise(function(resolve, reject) {
-                peerConnection.createOffer(function(offer) {
-                    peerConnection.state += CONNECTION_STATES.descriptionCreated;
-                    resolve(offer);
-                }, function(err) {
-                    reject(err);
-                });
-            });
+        value: async function(peerConnection) {
+            try {
+                const offer = await peerConnection.createOffer();
+                peerConnection.state += CONNECTION_STATES.descriptionCreated;
+                return offer;
+            } catch (error) {
+                console.error('Failed to create offer:', error);
+                throw error;
+            }
         }
     },
 
     _setLocalDescription: {
-        value: function(peerConnection, description) {
-            var self = this;
-            return new Promise.Promise(function(resolve, reject) {
-                peerConnection.setLocalDescription(description, function() {
-                    peerConnection.state += CONNECTION_STATES.localDescriptionSet;
-                    if (self._remoteIceCandidates[peerConnection.role] &&
-                        self._remoteIceCandidates[peerConnection.role].length > 0) {
-                        self._receiveIceCandidates(peerConnection, self._remoteIceCandidates[peerConnection.role]);
-                    }
-                    resolve(peerConnection.localDescription);
-                }, function(err) {
-                    reject(err);
-                });
-            });
+        value: async function(peerConnection, description) {
+            try {
+                await peerConnection.setLocalDescription(description);
+                peerConnection.state += CONNECTION_STATES.localDescriptionSet;
+                if (this._remoteIceCandidates[peerConnection.role] &&
+                    this._remoteIceCandidates[peerConnection.role].length > 0) {
+                    this._receiveIceCandidates(peerConnection, this._remoteIceCandidates[peerConnection.role]);
+                }
+                return peerConnection.localDescription;
+            } catch (error) {
+                console.error('Failed to set local description:', error);
+                throw error;
+            }
         }
     },
 
@@ -390,33 +415,32 @@ var RTCService = Target.specialize({
     },
 
     _setRemoteDescription: {
-        value: function(peerConnection, description) {
-            var self = this;
-            return new Promise.Promise(function(resolve, reject) {
-                peerConnection.setRemoteDescription(new RTCSessionDescription(description), function() {
-                    peerConnection.state += CONNECTION_STATES.remoteDescriptionSet;
-                    if (self._remoteIceCandidates[peerConnection.role] &&
-                        self._remoteIceCandidates[peerConnection.role].length > 0) {
-                        self._receiveIceCandidates(peerConnection, self._remoteIceCandidates[peerConnection.role]);
-                    }
-                    resolve(peerConnection.remoteDescription);
-                }, function(err) {
-                    reject(err);
-                });
-            });
+        value: async function(peerConnection, description) {
+            try {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(description));
+                peerConnection.state += CONNECTION_STATES.remoteDescriptionSet;
+                if (this._remoteIceCandidates[peerConnection.role] &&
+                    this._remoteIceCandidates[peerConnection.role].length > 0) {
+                    this._receiveIceCandidates(peerConnection, this._remoteIceCandidates[peerConnection.role]);
+                }
+                return peerConnection.remoteDescription;
+            } catch (error) {
+                console.error('Failed to set remote description:', error);
+                throw error;
+            }
         }
     },
 
     _createAnswer: {
-        value: function(peerConnection) {
-            return new Promise.Promise(function(resolve, reject) {
-                peerConnection.createAnswer(function(answer) {
-                    peerConnection.state += CONNECTION_STATES.descriptionCreated;
-                    resolve(answer);
-                }, function(err) {
-                    reject(err);
-                });
-            });
+        value: async function(peerConnection) {
+            try {
+                const answer = await peerConnection.createAnswer();
+                peerConnection.state += CONNECTION_STATES.descriptionCreated;
+                return answer;
+            } catch (error) {
+                console.error('Failed to create answer:', error);
+                throw error;
+            }
         }
     },
 
